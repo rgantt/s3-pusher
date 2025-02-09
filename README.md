@@ -10,6 +10,8 @@ A high-performance CLI tool for efficiently uploading directories to Amazon S3 w
 - 🔄 Caching of metadata to speed up subsequent uploads
 - 📁 Preserves directory structure in S3
 - 🔍 Verbose mode for detailed operation logging
+- 🎯 Memory-efficient buffer pool for optimal performance
+- 🔄 Configurable parallel upload settings
 
 ## Installation
 
@@ -34,10 +36,15 @@ s3-pusher --bucket <BUCKET_NAME> --directory <LOCAL_DIR> [OPTIONS]
 
 ### Arguments
 
-- `--bucket`, `-b`: The name of the S3 bucket to upload to (required)
-- `--directory`, `-d`: The local directory to upload (required)
+Required:
+- `--bucket`, `-b`: The name of the S3 bucket to upload to
+- `--directory`, `-d`: The local directory to upload
+
+Optional:
 - `--verbose`, `-v`: Enable verbose logging
-- `--cached-metadata`: Path to cached metadata file (optional, speeds up synchronization)
+- `--cached-metadata`: Path to cached metadata file (speeds up synchronization)
+- `--parallel-uploads`: Number of files to upload in parallel (default: 2)
+- `--concurrent-parts`: Number of concurrent part uploads per file (default: 10)
 
 ### Examples
 
@@ -56,14 +63,22 @@ Using cached metadata:
 s3-pusher --bucket my-bucket --directory ./data --cached-metadata .metadata.json
 ```
 
+Customizing parallel uploads:
+```bash
+s3-pusher --bucket my-bucket --directory ./data --parallel-uploads 4 --concurrent-parts 15
+```
+
 ## Performance
 
-- Uses 8MB chunks for multipart uploads
+- Uses 64MB chunks for multipart uploads (optimized for modern network speeds)
 - Automatically switches to multipart upload for files larger than 10MB
-- Parallel processing of uploads for improved throughput
+- Memory-efficient buffer pool to reduce allocation overhead
+- Configurable parallel processing:
+  - Control number of concurrent file uploads
+  - Adjust concurrent part uploads per file
 - Real-time progress bars showing:
   - Overall progress (files completed, total bytes transferred)
-  - Current transfer speed in Mbps
+  - Current transfer speed in MiB/s
   - Individual file progress
   - ETA for completion
 
@@ -71,18 +86,12 @@ s3-pusher --bucket my-bucket --directory ./data --cached-metadata .metadata.json
 
 - Written in Rust for maximum performance and reliability
 - Uses `aws-sdk-s3` for S3 operations
-- Implements efficient multipart uploads for large files
+- Advanced multipart upload features:
+  - Buffer pool for memory efficiency
+  - Configurable concurrency settings
+  - Automatic part size optimization
 - Maintains a local metadata cache to optimize synchronization
 - Progress tracking using `indicatif` for a great CLI experience
-
-## Dependencies
-
-- aws-config (1.0.1)
-- aws-sdk-s3 (1.4.0)
-- tokio (1.28)
-- clap (4.3)
-- indicatif (0.17)
-- And other supporting libraries (see Cargo.toml for full list)
 
 ## AWS Credentials
 
