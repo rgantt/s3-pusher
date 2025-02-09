@@ -167,6 +167,9 @@ impl TotalProgress {
             0.0
         };
         
+        // Set the actual progress position
+        progress_bar.set_position(transferred);
+        
         progress_bar.set_message(format!("{}/{} files, {}/{} @ {:.2} MiB/s (avg: {:.2} MiB/s)",
             files_done,
             self.total_files,
