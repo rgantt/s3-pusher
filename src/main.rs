@@ -333,7 +333,6 @@ async fn upload_file(
     }
 
     file_progress.finish_and_clear();
-    total_transfer.complete_file(file_info.size);
     Ok(())
 }
 
