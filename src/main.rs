@@ -287,6 +287,7 @@ async fn upload_multipart_file(
         .create_multipart_upload()
         .bucket(bucket)
         .key(&file_info.key)
+        .storage_class(aws_sdk_s3::types::StorageClass::StandardIa)
         .send()
         .await?;
     
@@ -399,6 +400,7 @@ async fn upload_small_file(
         .put_object()
         .bucket(bucket)
         .key(&file_info.key)
+        .storage_class(aws_sdk_s3::types::StorageClass::StandardIa)
         .body(aws_sdk_s3::primitives::ByteStream::from(buffer))
         .send()
         .await?;
