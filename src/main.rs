@@ -16,10 +16,11 @@ use humansize::{format_size, BINARY};
 use anyhow::Result;
 use tokio::sync::Mutex as TokioMutex;
 
-const CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8MB chunks for better multipart performance
+const CHUNK_SIZE: usize = 32 * 1024 * 1024; // 32MB chunks for better multipart performance
 const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024; // 5MB minimum for multipart uploads
 const MIN_MULTIPART_TOTAL_SIZE: u64 = 10 * 1024 * 1024; // Only use multipart for files > 10MB
-const MEGABIT: f64 = 1000.0 * 1000.0 / 8.0; // Convert bytes/sec to Mbps
+const MIB: f64 = 1024.0 * 1024.0; // bytes to MiB conversion
+const RATE_WINDOW: f64 = 1.0; // Calculate rates over a 1-second window
 const METADATA_FILE: &str = ".scanned_metadata";
 
 #[derive(Parser, Debug, Clone)]
@@ -36,6 +37,9 @@ struct Args {
 
     #[arg(long)]
     cached_metadata: Option<PathBuf>,
+
+    #[arg(long, default_value = "5", help = "Number of parallel upload workers")]
+    parallel_uploads: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,25 +53,47 @@ struct FileInfo {
 #[derive(Debug)]
 struct TotalProgress {
     start_time: Instant,
+    last_update_time: Arc<Mutex<Instant>>,
+    last_bytes: Arc<Mutex<u64>>,
     bytes_transferred: Arc<Mutex<u64>>,
     total_bytes: u64,
     total_files: usize,
     files_completed: Arc<Mutex<usize>>,
+    current_rate: Arc<Mutex<f64>>,
 }
 
 impl TotalProgress {
     fn new(total_bytes: u64, total_files: usize) -> Self {
+        let now = Instant::now();
         Self {
-            start_time: Instant::now(),
+            start_time: now,
+            last_update_time: Arc::new(Mutex::new(now)),
+            last_bytes: Arc::new(Mutex::new(0)),
             bytes_transferred: Arc::new(Mutex::new(0)),
             total_bytes,
             total_files,
             files_completed: Arc::new(Mutex::new(0)),
+            current_rate: Arc::new(Mutex::new(0.0)),
         }
     }
 
     fn add_bytes(&self, bytes: u64) {
-        *self.bytes_transferred.lock().unwrap() += bytes;
+        let mut bytes_transferred = self.bytes_transferred.lock().unwrap();
+        *bytes_transferred += bytes;
+        
+        // Update rate calculation
+        let now = Instant::now();
+        let mut last_update = self.last_update_time.lock().unwrap();
+        let mut last_bytes = self.last_bytes.lock().unwrap();
+        let mut current_rate = self.current_rate.lock().unwrap();
+        
+        let elapsed = now.duration_since(*last_update).as_secs_f64();
+        if elapsed >= RATE_WINDOW {
+            let rate = (*bytes_transferred - *last_bytes) as f64 / elapsed / MIB;
+            *current_rate = rate;
+            *last_bytes = *bytes_transferred;
+            *last_update = now;
+        }
     }
 
     fn inc_files(&self) {
@@ -83,23 +109,26 @@ impl TotalProgress {
     }
 
     fn rate(&self) -> f64 {
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            self.bytes_transferred() as f64 / elapsed / MEGABIT
-        } else {
-            0.0
-        }
+        *self.current_rate.lock().unwrap()
     }
 
     fn update_progress(&self, progress_bar: &ProgressBar) {
         let transferred = self.bytes_transferred();
         let files_done = self.files_completed();
-        progress_bar.set_message(format!("{}/{} files, {}/{} @ {:.2} Mbps",
+        let current_rate = self.rate();
+        let avg_rate = if self.start_time.elapsed().as_secs_f64() > 0.0 {
+            transferred as f64 / self.start_time.elapsed().as_secs_f64() / MIB
+        } else {
+            0.0
+        };
+        
+        progress_bar.set_message(format!("{}/{} files, {}/{} @ {:.2} MiB/s (avg: {:.2} MiB/s)",
             files_done,
             self.total_files,
             format_size(transferred, BINARY),
             format_size(self.total_bytes, BINARY),
-            self.rate()
+            current_rate,
+            avg_rate
         ));
     }
 }
@@ -533,9 +562,9 @@ async fn main() -> Result<()> {
         files_to_upload.into_iter().map(|f| Arc::new(f))
     )));
 
-    // Spawn two upload workers
+    // Spawn parallel upload workers
     let mut worker_handles = vec![];
-    for worker_id in 0..2 {
+    for worker_id in 0..args.parallel_uploads {
         let client = client.clone();
         let bucket = args.bucket.clone();
         let multi_progress = multi_progress.clone();
