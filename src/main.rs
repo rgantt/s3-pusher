@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc, Local, TimeZone};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::fs;
@@ -14,6 +14,7 @@ use std::time::Duration as StdDuration;
 use std::time::Instant;
 use humansize::{format_size, BINARY};
 use anyhow::Result;
+use tokio::sync::Mutex as TokioMutex;
 
 const CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8MB chunks for better multipart performance
 const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024; // 5MB minimum for multipart uploads
@@ -21,7 +22,7 @@ const MIN_MULTIPART_TOTAL_SIZE: u64 = 10 * 1024 * 1024; // Only use multipart fo
 const MEGABIT: f64 = 1000.0 * 1000.0 / 8.0; // Convert bytes/sec to Mbps
 const METADATA_FILE: &str = ".scanned_metadata";
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
@@ -527,18 +528,54 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Upload files
-    for file_info in files_to_upload {
-        if let Err(e) = upload_file(
-            &client,
-            &args.bucket,
-            &file_info,
-            &multi_progress,
-            &total_transfer,
-            &args,
-        ).await {
-            eprintln!("Error uploading {}: {}", file_info.key, e);
-        }
+    // Create a shared queue for all workers
+    let queue = Arc::new(TokioMutex::new(VecDeque::from_iter(
+        files_to_upload.into_iter().map(|f| Arc::new(f))
+    )));
+
+    // Spawn two upload workers
+    let mut worker_handles = vec![];
+    for worker_id in 0..2 {
+        let client = client.clone();
+        let bucket = args.bucket.clone();
+        let multi_progress = multi_progress.clone();
+        let total_transfer = total_transfer.clone();
+        let args = args.clone();
+        let error_pb = multi_progress.add(ProgressBar::hidden());
+        let queue = queue.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                // Try to get next file from queue
+                let file_info = {
+                    let mut queue = queue.lock().await;
+                    queue.pop_front()
+                };
+
+                match file_info {
+                    Some(file_info) => {
+                        if let Err(e) = upload_file(
+                            &client,
+                            &bucket,
+                            &file_info,
+                            &multi_progress,
+                            &total_transfer,
+                            &args,
+                        ).await {
+                            error_pb.println(format!("Error uploading {}: {}", file_info.key, e));
+                        }
+                    },
+                    None => break, // No more files to process
+                }
+            }
+            error_pb.finish_and_clear();
+        });
+        worker_handles.push(handle);
+    }
+
+    // Wait for all workers to complete
+    for handle in worker_handles {
+        handle.await?;
     }
 
     progress.finish_with_message("Upload complete");
