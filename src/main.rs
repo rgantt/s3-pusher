@@ -4,24 +4,56 @@ use chrono::{DateTime, Utc, Local, TimeZone};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::fs;
-use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Semaphore;
 use std::time::Duration as StdDuration;
 use std::time::Instant;
 use humansize::{format_size, BINARY};
 use anyhow::Result;
-use tokio::sync::Mutex as TokioMutex;
 
-const CHUNK_SIZE: usize = 32 * 1024 * 1024; // 32MB chunks for better multipart performance
+const CHUNK_SIZE: usize = 64 * 1024 * 1024; // 64MB chunks for better multipart performance
 const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024; // 5MB minimum for multipart uploads
 const MIN_MULTIPART_TOTAL_SIZE: u64 = 10 * 1024 * 1024; // Only use multipart for files > 10MB
 const MIB: f64 = 1024.0 * 1024.0; // bytes to MiB conversion
 const RATE_WINDOW: f64 = 1.0; // Calculate rates over a 1-second window
 const METADATA_FILE: &str = ".scanned_metadata";
+const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB minimum part size
+
+// Buffer pool for reusing allocated buffers in multipart uploads
+struct BufferPool {
+    buffers: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    buffer_size: usize,
+}
+
+impl BufferPool {
+    fn new(pool_size: usize, buffer_size: usize) -> Self {
+        let mut buffers = VecDeque::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            buffers.push_back(vec![0; buffer_size]);
+        }
+        BufferPool {
+            buffers: Arc::new(Mutex::new(buffers)),
+            buffer_size,
+        }
+    }
+
+    async fn acquire(&self) -> Vec<u8> {
+        let mut buffers = self.buffers.lock().unwrap();
+        buffers.pop_front().unwrap_or_else(|| vec![0; self.buffer_size])
+    }
+
+    fn release(&self, buffer: Vec<u8>) {
+        if buffer.capacity() == self.buffer_size {
+            let mut buffers = self.buffers.lock().unwrap();
+            buffers.push_back(buffer);
+        }
+    }
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -38,8 +70,11 @@ struct Args {
     #[arg(long)]
     cached_metadata: Option<PathBuf>,
 
-    #[arg(long, default_value = "5", help = "Number of parallel upload workers")]
+    #[arg(long, default_value = "2", help = "Number of files to upload in parallel")]
     parallel_uploads: usize,
+
+    #[arg(long, default_value = "10", help = "Number of concurrent part uploads per file")]
+    concurrent_parts: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +129,16 @@ impl TotalProgress {
             *last_bytes = *bytes_transferred;
             *last_update = now;
         }
+    }
+
+    fn complete_file(&self, file_size: u64) {
+        let mut bytes_transferred = self.bytes_transferred.lock().unwrap();
+        // Calculate how many bytes we need to add to reach the file size
+        // This ensures we don't miss any bytes due to chunked reading
+        let remaining_bytes = file_size.saturating_sub(*bytes_transferred % file_size);
+        *bytes_transferred += remaining_bytes;
+        
+        self.inc_files();
     }
 
     fn inc_files(&self) {
@@ -285,7 +330,7 @@ async fn upload_file(
     }
 
     file_progress.finish_and_clear();
-    total_transfer.inc_files();
+    total_transfer.complete_file(file_info.size);
     Ok(())
 }
 
@@ -298,85 +343,119 @@ async fn upload_multipart_file(
     _multi_progress: &MultiProgress,
     args: &Args,
 ) -> Result<()> {
-    if args.verbose {
-        println!("Starting multipart upload for {} ({})",
-            file_info.key,
-            format_size(file_info.size, BINARY));
-    }
-
-    let mut file = fs::File::open(&file_info.path).await?;
-    let mut buffer = Vec::with_capacity(CHUNK_SIZE);
-    let mut part_number: i32 = 1;
-    let mut completed_parts: Vec<CompletedPart> = Vec::new();
-    let update_interval = StdDuration::from_millis(100);
-    let mut last_update = Instant::now();
-    let mut remaining_size = file_info.size;
-
-    // Start multipart upload
-    let create_multipart_res = client
+    // Create a buffer pool with size equal to concurrent_parts
+    let buffer_pool = Arc::new(BufferPool::new(args.concurrent_parts, CHUNK_SIZE));
+    
+    // Initialize multipart upload
+    let create_multipart_resp = client
         .create_multipart_upload()
         .bucket(bucket)
         .key(&file_info.key)
-        .storage_class(aws_sdk_s3::types::StorageClass::StandardIa)
         .send()
         .await?;
-    
-    let upload_id = create_multipart_res.upload_id().unwrap();
-    if args.verbose {
-        println!("Got upload ID: {}", upload_id);
-    }
 
-    // Upload parts
-    while remaining_size > 0 {
-        let to_read = std::cmp::min(remaining_size as usize, CHUNK_SIZE);
-        if args.verbose {
-            println!("Reading chunk {} of size {}",
-                part_number,
-                format_size(to_read as u64, BINARY));
-        }
+    let upload_id = create_multipart_resp.upload_id().ok_or_else(|| {
+        anyhow::anyhow!("Failed to get upload ID from create_multipart_upload response")
+    })?;
 
-        buffer.clear();
-        buffer.resize(to_read, 0);
-        let mut bytes_read = 0;
+    let completed_parts = Arc::new(TokioMutex::new(Vec::new()));
+    let last_update = Arc::new(TokioMutex::new(Instant::now()));
+    let update_interval = StdDuration::from_millis(100);
 
-        while bytes_read < to_read {
-            match file.read(&mut buffer[bytes_read..to_read]).await? {
-                0 => break,
-                n => {
-                    bytes_read += n;
-                    if last_update.elapsed() >= update_interval {
-                        file_progress.inc(n as u64);
-                        total_transfer.add_bytes(n as u64);
-                        last_update = Instant::now();
+    let file_size = file_info.size as usize;
+    let num_parts = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let semaphore = Arc::new(Semaphore::new(args.concurrent_parts));
+    let mut upload_tasks = Vec::new();
+
+    for part_number in 1..=num_parts {
+        let start_pos = (part_number - 1) * CHUNK_SIZE;
+        let this_part_size = if part_number == num_parts {
+            file_size - start_pos
+        } else {
+            CHUNK_SIZE
+        };
+
+        let permit = semaphore.clone().acquire_owned().await?;
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let key = file_info.key.clone();
+        let upload_id = upload_id.to_string();
+        let completed_parts = completed_parts.clone();
+        let file_progress = file_progress.clone();
+        let total_transfer = total_transfer.clone();
+        let last_update = last_update.clone();
+        let verbose = args.verbose;
+        let buffer_pool = buffer_pool.clone();
+        let file_path = file_info.path.clone();
+
+        let task = tokio::spawn(async move {
+            // Open a new file handle for this part
+            let mut file = fs::File::open(&file_path).await?;
+            file.seek(std::io::SeekFrom::Start(start_pos as u64)).await?;
+            
+            // Get a buffer from the pool
+            let mut buffer = buffer_pool.acquire().await;
+            
+            let mut bytes_read = 0;
+            while bytes_read < this_part_size {
+                match file.read(&mut buffer[bytes_read..this_part_size]).await? {
+                    0 => break,
+                    n => {
+                        bytes_read += n;
+                        let mut last_update = last_update.lock().await;
+                        if last_update.elapsed() >= update_interval {
+                            file_progress.inc(n as u64);
+                            total_transfer.add_bytes(n as u64);
+                            *last_update = Instant::now();
+                        }
                     }
                 }
             }
-        }
 
-        // Upload the part
-        let part = client
-            .upload_part()
-            .bucket(bucket)
-            .key(&file_info.key)
-            .upload_id(upload_id)
-            .body(aws_sdk_s3::primitives::ByteStream::from(buffer[..bytes_read].to_vec()))
-            .part_number(part_number)
-            .send()
-            .await?;
+            if verbose {
+                println!("Uploading part {} ({} bytes)", part_number, bytes_read);
+            }
 
-        let completed_part = CompletedPart::builder()
-            .e_tag(part.e_tag.unwrap())
-            .part_number(part_number)
-            .build();
+            let part = client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .body(aws_sdk_s3::primitives::ByteStream::from(buffer[..bytes_read].to_vec()))
+                .part_number(part_number as i32)
+                .send()
+                .await?;
 
-        completed_parts.push(completed_part);
-        remaining_size -= bytes_read as u64;
-        part_number += 1;
+            // Return the buffer to the pool
+            buffer_pool.release(buffer);
+
+            let completed_part = CompletedPart::builder()
+                .e_tag(part.e_tag.unwrap())
+                .part_number(part_number as i32)
+                .build();
+
+            let mut completed_parts = completed_parts.lock().await;
+            completed_parts.push(completed_part);
+
+            drop(permit);
+            Ok::<_, anyhow::Error>(())
+        });
+
+        upload_tasks.push(task);
     }
 
+    // Wait for all upload tasks to complete
+    for task in upload_tasks {
+        task.await??;
+    }
+
+    // Sort completed parts by part number to ensure correct order
+    let mut completed_parts = completed_parts.lock().await;
+    completed_parts.sort_by_key(|part| part.part_number());
+    
     // Complete multipart upload
     let completed_upload = CompletedMultipartUpload::builder()
-        .set_parts(Some(completed_parts))
+        .set_parts(Some(completed_parts.to_vec()))
         .build();
 
     client
@@ -387,6 +466,9 @@ async fn upload_multipart_file(
         .multipart_upload(completed_upload)
         .send()
         .await?;
+
+    // Ensure total progress is accurate
+    total_transfer.complete_file(file_info.size);
 
     Ok(())
 }
