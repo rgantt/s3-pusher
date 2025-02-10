@@ -12,6 +12,7 @@ A high-performance CLI tool for efficiently uploading directories to Amazon S3 w
 - 🔍 Verbose mode for detailed operation logging
 - 🎯 Memory-efficient buffer pool for optimal performance
 - 🔄 Configurable parallel upload settings
+- 🗑️ Optional deletion of remote files not present locally (--onto flag)
 
 ## Installation
 
@@ -45,6 +46,7 @@ Optional:
 - `--cached-metadata`: Path to cached metadata file (speeds up synchronization)
 - `--parallel-uploads`: Number of files to upload in parallel (default: 2)
 - `--concurrent-parts`: Number of concurrent part uploads per file (default: 10)
+- `--onto`: Delete remote files not present locally
 
 ### Examples
 
@@ -66,6 +68,11 @@ s3-pusher --bucket my-bucket --directory ./data --cached-metadata .metadata.json
 Customizing parallel uploads:
 ```bash
 s3-pusher --bucket my-bucket --directory ./data --parallel-uploads 4 --concurrent-parts 15
+```
+
+Deleting remote files not present locally:
+```bash
+s3-pusher --bucket my-bucket --directory ./data --onto
 ```
 
 ## Performance

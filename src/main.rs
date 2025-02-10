@@ -75,6 +75,9 @@ struct Args {
 
     #[arg(long, default_value = "10", help = "Number of concurrent part uploads per file")]
     concurrent_parts: usize,
+
+    #[arg(long, help = "Delete files in S3 that don't exist locally")]
+    onto: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,9 +283,11 @@ async fn get_s3_metadata(client: &Client, bucket: &str, prefix: Option<&str>) ->
     Ok(files)
 }
 
-async fn reconcile_metadata(local_files: &[FileInfo], s3_files: &[FileInfo], args: &Args) -> Vec<FileInfo> {
+async fn reconcile_metadata(local_files: &[FileInfo], s3_files: &[FileInfo], args: &Args) -> Result<(Vec<FileInfo>, Vec<String>)> {
     let mut to_upload = Vec::new();
+    let mut to_delete = Vec::new();
 
+    // Find files to upload
     for file in local_files {
         let should_upload = match s3_files.iter().find(|f| f.key == file.key) {
             Some(s3_file) => {
@@ -306,7 +311,19 @@ async fn reconcile_metadata(local_files: &[FileInfo], s3_files: &[FileInfo], arg
         }
     }
 
-    to_upload
+    // If --onto flag is set, find files to delete
+    if args.onto {
+        for s3_file in s3_files {
+            if !local_files.iter().any(|f| f.key == s3_file.key) {
+                if args.verbose {
+                    println!("Will delete from S3: {} (not present locally)", s3_file.key);
+                }
+                to_delete.push(s3_file.key.clone());
+            }
+        }
+    }
+
+    Ok((to_upload, to_delete))
 }
 
 async fn upload_file(
@@ -569,6 +586,25 @@ async fn delete_s3_object(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    
+    // Check if directory exists before proceeding
+    if !Path::new(&args.directory).exists() {
+        return Err(anyhow::anyhow!(
+            "Directory '{}' does not exist. Please check the path and try again.",
+            args.directory.display()
+        ));
+    }
+
+    // Check if cached metadata file exists if provided
+    if let Some(cached_path) = &args.cached_metadata {
+        if !Path::new(cached_path).exists() {
+            return Err(anyhow::anyhow!(
+                "Cached metadata file '{}' does not exist. Please check the path and try again.",
+                cached_path.display()
+            ));
+        }
+    }
+
     let client = get_s3_client().await?;
     
     // Canonicalize the directory path
@@ -601,21 +637,16 @@ async fn main() -> Result<()> {
 
     // Calculate total size of all files and files to upload
     let total_size: u64 = files.iter().map(|f| f.size).sum();
-    let files_to_upload: Vec<_> = files.into_iter()
-        .filter(|file| {
-            if let Some(s3_file) = s3_files.iter().find(|f| f.key == file.key) {
-                file.size != s3_file.size
-            } else {
-                true
-            }
-        })
-        .collect();
+    let (files_to_upload, files_to_delete) = reconcile_metadata(&files, &s3_files, &args).await?;
     let upload_size: u64 = files_to_upload.iter().map(|f| f.size).sum();
 
     println!("Total size of all files: {}", format_size(total_size, BINARY));
     println!("Found {} files ({}) to upload", 
         files_to_upload.len(),
         format_size(upload_size, BINARY));
+    if !files_to_delete.is_empty() {
+        println!("Found {} files to delete from S3", files_to_delete.len());
+    }
     
     // Set up progress bars only after we have all the metadata
     let multi_progress = MultiProgress::new();
@@ -689,6 +720,13 @@ async fn main() -> Result<()> {
     // Wait for all workers to complete
     for handle in worker_handles {
         handle.await?;
+    }
+
+    // Delete files from S3 if --onto flag is set
+    if args.onto {
+        for key in &files_to_delete {
+            delete_s3_object(&client, &args.bucket, key, args.verbose).await?;
+        }
     }
 
     progress.finish_with_message("Upload complete");
